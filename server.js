@@ -87,15 +87,22 @@ const app = express();
 
 // Доверять заголовку X-Forwarded-For только за известным прокси.
 // Без этого клиент мог бы подделать X-Forwarded-For и обойти rate-limit.
-// TRUST_PROXY: число хопов прокси (напр. 1 за nginx) или 'false' если нет прокси.
-const trustProxy = process.env.TRUST_PROXY ?? 'false';
-app.set('trust proxy', trustProxy === 'false' ? false : (/^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy));
+const trustProxyRaw = process.env.TRUST_PROXY ?? 'false';
+if (trustProxyRaw === 'false' || trustProxyRaw === 'true') {
+  app.set('trust proxy', trustProxyRaw === 'true');
+} else if (/^\d+$/.test(trustProxyRaw)) {
+  app.set('trust proxy', Number(trustProxyRaw));
+} else {
+  app.set('trust proxy', false);
+}
 
 // Базовые заголовки безопасности
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
   res.setHeader(
     'Content-Security-Policy',
     "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
@@ -107,7 +114,10 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json({ limit: '32kb' }));
-app.use(express.static(__dirname)); // отдаёт index.html и статику
+app.use(express.static(__dirname, {
+  dotfiles: 'ignore',
+  index: ['index.html'],
+}));
 
 // простая защита от спама: максимум 5 ответов с одного IP за 10 минут
 const rate = new Map();
@@ -137,8 +147,14 @@ function clean(v, max = 500) {
   return String(v ?? '').trim().slice(0, max);
 }
 
+function normalizeIp(raw) {
+  const ip = (raw || '').trim();
+  if (ip.startsWith('::ffff:')) return ip.slice(7);
+  return ip;
+}
+
 app.post('/api/rsvp', (req, res) => {
-  const ip = (req.ip || req.socket.remoteAddress || '').trim();
+  const ip = normalizeIp(req.ip || req.socket.remoteAddress);
   if (rateLimited(ip)) {
     return res.status(429).json({ ok: false, error: 'Слишком много запросов. Попробуйте позже.' });
   }
