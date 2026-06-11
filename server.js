@@ -3,7 +3,7 @@ import Database from 'better-sqlite3';
 import nodemailer from 'nodemailer';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import 'dotenv/config';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -99,8 +99,9 @@ app.use((req, res, next) => {
   res.setHeader(
     'Content-Security-Policy',
     "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
-      "font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; " +
-      "connect-src 'self'; img-src 'self' data:; base-uri 'self'; form-action 'self'",
+      "font-src 'self' https://fonts.gstatic.com; script-src 'self'; " +
+      "connect-src 'self'; img-src 'self' data:; base-uri 'self'; form-action 'self'; " +
+      "object-src 'none'; frame-ancestors 'none'",
   );
   next();
 });
@@ -115,9 +116,12 @@ const RATE_MAX = 5;
 function rateLimited(ip) {
   const now = Date.now();
   const hits = (rate.get(ip) || []).filter((t) => now - t < RATE_WINDOW_MS);
-  hits.push(now);
   rate.set(ip, hits);
-  return hits.length > RATE_MAX;
+  // Уже достигнут лимит — блокируем и не засчитываем новую попытку,
+  // чтобы повторные запросы не продлевали окно блокировки бесконечно.
+  if (hits.length >= RATE_MAX) return true;
+  hits.push(now);
+  return false;
 }
 // периодическая очистка устаревших записей, чтобы Map не рос бесконечно
 setInterval(() => {
@@ -170,21 +174,22 @@ app.post('/api/rsvp', (req, res) => {
   }
 });
 
-// Постоянное по времени сравнение строк (защита от timing-атак)
+// Постоянное по времени сравнение строк (защита от timing-атак).
+// Хэшируем оба значения до фиксированной длины, чтобы не раскрывать
+// длину секрета через раннюю проверку длины буферов.
 function safeEqual(a, b) {
-  const bufA = Buffer.from(String(a));
-  const bufB = Buffer.from(String(b));
-  if (bufA.length !== bufB.length) return false;
+  const bufA = createHash('sha256').update(String(a)).digest();
+  const bufB = createHash('sha256').update(String(b)).digest();
   return timingSafeEqual(bufA, bufB);
 }
 
 // Просмотр всех ответов (защищён токеном).
-// Токен принимается через заголовок Authorization: Bearer <token>
-// либо (для совместимости) через ?token=...
+// Токен принимается только через заголовок Authorization: Bearer <token>.
+// Передача через ?token=... убрана: query-параметры утекают в логи прокси,
+// историю браузера и Referer.
 app.get('/api/admin/rsvp', (req, res) => {
   const header = req.headers.authorization || '';
-  const bearer = header.startsWith('Bearer ') ? header.slice(7) : '';
-  const provided = bearer || req.query.token || '';
+  const provided = header.startsWith('Bearer ') ? header.slice(7) : '';
   if (!ADMIN_TOKEN || !safeEqual(provided, ADMIN_TOKEN)) {
     return res.status(401).json({ ok: false, error: 'Unauthorized' });
   }
