@@ -114,10 +114,20 @@ app.use((req, res, next) => {
 });
 
 app.use(express.json({ limit: '32kb' }));
-app.use(express.static(__dirname, {
-  dotfiles: 'ignore',
-  index: ['index.html'],
-}));
+
+// Раздаём ТОЛЬКО явно разрешённые публичные файлы.
+// Отдавать весь __dirname статикой нельзя: иначе наружу утекают
+// server.js, rsvp.db, package.json, .env и прочие серверные файлы.
+const PUBLIC_FILES = {
+  '/': 'index.html',
+  '/index.html': 'index.html',
+  '/app.js': 'app.js',
+};
+app.get(Object.keys(PUBLIC_FILES), (req, res, next) => {
+  res.sendFile(join(__dirname, PUBLIC_FILES[req.path]), (err) => {
+    if (err) next(err);
+  });
+});
 
 // простая защита от спама: максимум 5 ответов с одного IP за 10 минут
 const rate = new Map();
