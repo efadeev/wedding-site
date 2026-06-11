@@ -3,6 +3,7 @@ import Database from 'better-sqlite3';
 import nodemailer from 'nodemailer';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { timingSafeEqual } from 'node:crypto';
 import 'dotenv/config';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -83,26 +84,57 @@ function sendNotification(row) {
 
 /* ------------------------------ Server ------------------------------ */
 const app = express();
+
+// Доверять заголовку X-Forwarded-For только за известным прокси.
+// Без этого клиент мог бы подделать X-Forwarded-For и обойти rate-limit.
+// TRUST_PROXY: число хопов прокси (напр. 1 за nginx) или 'false' если нет прокси.
+const trustProxy = process.env.TRUST_PROXY ?? 'false';
+app.set('trust proxy', trustProxy === 'false' ? false : (/^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy));
+
+// Базовые заголовки безопасности
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader(
+    'Content-Security-Policy',
+    "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
+      "font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; " +
+      "connect-src 'self'; img-src 'self' data:; base-uri 'self'; form-action 'self'",
+  );
+  next();
+});
+
 app.use(express.json({ limit: '32kb' }));
 app.use(express.static(__dirname)); // отдаёт index.html и статику
 
 // простая защита от спама: максимум 5 ответов с одного IP за 10 минут
 const rate = new Map();
+const RATE_WINDOW_MS = 10 * 60 * 1000;
+const RATE_MAX = 5;
 function rateLimited(ip) {
   const now = Date.now();
-  const windowMs = 10 * 60 * 1000;
-  const hits = (rate.get(ip) || []).filter((t) => now - t < windowMs);
+  const hits = (rate.get(ip) || []).filter((t) => now - t < RATE_WINDOW_MS);
   hits.push(now);
   rate.set(ip, hits);
-  return hits.length > 5;
+  return hits.length > RATE_MAX;
 }
+// периодическая очистка устаревших записей, чтобы Map не рос бесконечно
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, hits] of rate) {
+    const fresh = hits.filter((t) => now - t < RATE_WINDOW_MS);
+    if (fresh.length) rate.set(ip, fresh);
+    else rate.delete(ip);
+  }
+}, RATE_WINDOW_MS).unref();
 
 function clean(v, max = 500) {
   return String(v ?? '').trim().slice(0, max);
 }
 
 app.post('/api/rsvp', (req, res) => {
-  const ip = (req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || '').trim();
+  const ip = (req.ip || req.socket.remoteAddress || '').trim();
   if (rateLimited(ip)) {
     return res.status(429).json({ ok: false, error: 'Слишком много запросов. Попробуйте позже.' });
   }
@@ -120,7 +152,7 @@ app.post('/api/rsvp', (req, res) => {
     name,
     attending,
     plusone: attending === 'yes' && b.plusone === 'yes' ? 'yes' : 'no',
-    plusone_name: clean(b.plusone_name, 120),
+    plusone_name: attending === 'yes' && b.plusone === 'yes' ? clean(b.plusone_name, 120) : '',
     food: attending === 'yes' ? toCsv(b.food) : '',
     drink: attending === 'yes' ? toCsv(b.drink) : '',
     allergies: attending === 'yes' ? clean(b.allergies, 500) : '',
@@ -138,9 +170,22 @@ app.post('/api/rsvp', (req, res) => {
   }
 });
 
-// Просмотр всех ответов (защищён токеном): GET /api/admin/rsvp?token=...
+// Постоянное по времени сравнение строк (защита от timing-атак)
+function safeEqual(a, b) {
+  const bufA = Buffer.from(String(a));
+  const bufB = Buffer.from(String(b));
+  if (bufA.length !== bufB.length) return false;
+  return timingSafeEqual(bufA, bufB);
+}
+
+// Просмотр всех ответов (защищён токеном).
+// Токен принимается через заголовок Authorization: Bearer <token>
+// либо (для совместимости) через ?token=...
 app.get('/api/admin/rsvp', (req, res) => {
-  if (!ADMIN_TOKEN || req.query.token !== ADMIN_TOKEN) {
+  const header = req.headers.authorization || '';
+  const bearer = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const provided = bearer || req.query.token || '';
+  if (!ADMIN_TOKEN || !safeEqual(provided, ADMIN_TOKEN)) {
     return res.status(401).json({ ok: false, error: 'Unauthorized' });
   }
   const rows = db.prepare('SELECT * FROM rsvp ORDER BY created_at DESC').all();
@@ -152,6 +197,23 @@ app.get('/api/admin/rsvp', (req, res) => {
   };
   res.json({ ok: true, summary, rows });
 });
+
+// Обработчик ошибок: невалидный JSON и прочие сбои middleware
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (err.type === 'entity.parse.failed') {
+    return res.status(400).json({ ok: false, error: 'Некорректный формат запроса.' });
+  }
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({ ok: false, error: 'Слишком большой запрос.' });
+  }
+  console.error('Необработанная ошибка:', err.message);
+  return res.status(500).json({ ok: false, error: 'Внутренняя ошибка сервера.' });
+});
+
+if (!ADMIN_TOKEN) {
+  console.warn('ADMIN_TOKEN не задан — эндпоинт /api/admin/rsvp недоступен (всегда 401).');
+}
 
 app.listen(PORT, () => {
   console.log(`Сайт-приглашение запущен: http://localhost:${PORT}`);

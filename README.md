@@ -49,6 +49,14 @@ MAIL_TO=куда-слать@example.com
 
 ## Просмотр ответов
 
+Рекомендуемый способ — передавать токен в заголовке (не попадает в логи):
+
+```bash
+curl -H "Authorization: Bearer ВАШ_ADMIN_TOKEN" "http://localhost:3000/api/admin/rsvp"
+```
+
+Допустимо и через query-параметр (но токен может оседать в логах прокси/сервера):
+
 ```bash
 curl "http://localhost:3000/api/admin/rsvp?token=ВАШ_ADMIN_TOKEN"
 ```
